@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
-from pydantic import BaseModel
-from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
+from pydantic import BaseModel, Field
+from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders, restock_catalog, restock_orders
+from datetime import date, timedelta
 
 app = FastAPI(title="Factory Inventory Management System")
 
@@ -119,6 +120,53 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockRecommendation(BaseModel):
+    item_sku: str
+    item_name: str
+    category: str
+    supplier: str
+    trend: str
+    forecasted_demand: int
+    quantity_on_hand: int
+    shortfall: int
+    recommended_quantity: int
+    unit_cost: float
+    line_total: float
+    lead_time_days: int
+
+class RestockRecommendationResponse(BaseModel):
+    budget: float
+    total_cost: float
+    remaining_budget: float
+    items: List[RestockRecommendation]
+
+class RestockOrderLineRequest(BaseModel):
+    item_sku: str
+    quantity: int = Field(gt=0)
+
+class CreateRestockOrderRequest(BaseModel):
+    budget: float = Field(ge=0)
+    items: List[RestockOrderLineRequest] = Field(min_length=1)
+
+class RestockOrderLine(BaseModel):
+    item_sku: str
+    item_name: str
+    quantity: int
+    unit_cost: float
+    line_total: float
+    lead_time_days: int
+
+class RestockOrder(BaseModel):
+    id: str
+    order_number: str
+    items: List[RestockOrderLine]
+    total_cost: float
+    budget: float
+    lead_time_days: int
+    order_date: str
+    expected_delivery: str
+    status: str
 
 # API endpoints
 @app.get("/")
@@ -303,6 +351,77 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+def _build_recommendations(budget: float) -> RestockRecommendationResponse:
+    """Greedy, priority-ranked restock recommendations within a budget."""
+    catalog = {c['item_sku']: c for c in restock_catalog}
+    candidates = []
+    for f in demand_forecasts:
+        c = catalog.get(f['item_sku'])
+        if not c:
+            continue  # forecast SKU with no supplier pricing cannot be restocked
+        # Shortfall = forecasted demand not covered by current stock
+        shortfall = max(f['forecasted_demand'] - c['quantity_on_hand'], 0)
+        if shortfall > 0:
+            candidates.append((f, c, shortfall))
+    # Most urgent first: largest shortfall, ties broken by rising trend
+    candidates.sort(key=lambda x: (-x[2], x[0]['trend'] != 'increasing'))
+
+    remaining = round(budget, 2)
+    items = []
+    for f, c, shortfall in candidates:
+        # Buy the full shortfall if affordable, otherwise as many whole units as the budget allows
+        qty = min(shortfall, int(remaining // c['unit_cost']))
+        if qty <= 0:
+            continue
+        line_total = round(qty * c['unit_cost'], 2)
+        remaining = round(remaining - line_total, 2)
+        items.append(RestockRecommendation(
+            item_sku=f['item_sku'], item_name=f['item_name'], category=c['category'],
+            supplier=c['supplier'], trend=f['trend'], forecasted_demand=f['forecasted_demand'],
+            quantity_on_hand=c['quantity_on_hand'], shortfall=shortfall, recommended_quantity=qty,
+            unit_cost=c['unit_cost'], line_total=line_total, lead_time_days=c['lead_time_days']))
+    total = round(sum(i.line_total for i in items), 2)
+    return RestockRecommendationResponse(budget=budget, total_cost=total,
+                                         remaining_budget=round(budget - total, 2), items=items)
+
+@app.get("/api/restock/recommendations", response_model=RestockRecommendationResponse)
+def get_restock_recommendations(budget: float = Query(0, ge=0)):
+    """Recommend items from the demand forecast to restock within the given budget"""
+    return _build_recommendations(budget)
+
+@app.post("/api/restock/orders", response_model=RestockOrder, status_code=201)
+def create_restock_order(request: CreateRestockOrderRequest):
+    """Submit a restock order. Prices and lead times come from the catalog, never the client."""
+    catalog = {c['item_sku']: c for c in restock_catalog}
+    names = {f['item_sku']: f['item_name'] for f in demand_forecasts}
+    lines = []
+    for line in request.items:
+        c = catalog.get(line.item_sku)
+        if not c:
+            raise HTTPException(status_code=404, detail=f"SKU {line.item_sku} not found in restock catalog")
+        lines.append(RestockOrderLine(
+            item_sku=line.item_sku, item_name=names.get(line.item_sku, line.item_sku),
+            quantity=line.quantity, unit_cost=c['unit_cost'],
+            line_total=round(line.quantity * c['unit_cost'], 2), lead_time_days=c['lead_time_days']))
+    total = round(sum(l.line_total for l in lines), 2)
+    if total > request.budget:
+        raise HTTPException(status_code=400, detail="Order total exceeds budget")
+    # The whole order arrives when its slowest item does
+    lead = max(l.lead_time_days for l in lines)
+    today = date.today()
+    seq = len(restock_orders) + 1
+    order = RestockOrder(
+        id=str(seq), order_number=f"RST-{today.year}-{seq:04d}", items=lines, total_cost=total,
+        budget=request.budget, lead_time_days=lead, order_date=today.isoformat(),
+        expected_delivery=(today + timedelta(days=lead)).isoformat(), status="Submitted")
+    restock_orders.append(order.model_dump())
+    return order
+
+@app.get("/api/restock/orders", response_model=List[RestockOrder])
+def get_restock_orders():
+    """List submitted restock orders, newest first"""
+    return list(reversed(restock_orders))
 
 if __name__ == "__main__":
     import uvicorn
