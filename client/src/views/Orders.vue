@@ -74,6 +74,39 @@
           </table>
         </div>
       </div>
+
+      <div class="card submitted-orders">
+        <div class="card-header">
+          <h3 class="card-title">{{ t('orders.submitted.title') }} ({{ restockOrders.length }})</h3>
+        </div>
+        <div v-if="restockOrders.length === 0" class="empty-state">{{ t('orders.submitted.empty') }}</div>
+        <div v-else class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>{{ t('orders.table.orderNumber') }}</th>
+                <th>{{ t('orders.table.orderDate') }}</th>
+                <th>{{ t('orders.table.items') }}</th>
+                <th>{{ t('orders.table.totalValue') }}</th>
+                <th>{{ t('orders.submitted.leadTime') }}</th>
+                <th>{{ t('orders.table.expectedDelivery') }}</th>
+                <th>{{ t('orders.table.status') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="ro in restockOrders" :key="ro.id">
+                <td><strong>{{ ro.order_number }}</strong></td>
+                <td>{{ formatDate(ro.order_date) }}</td>
+                <td>{{ t('orders.submitted.itemsSummary', { count: ro.items.length, qty: restockUnits(ro) }) }}</td>
+                <td><strong>{{ currencySymbol }}{{ ro.total_cost.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}</strong></td>
+                <td>{{ ro.lead_time_days }}</td>
+                <td>{{ formatDate(ro.expected_delivery) }}</td>
+                <td><span class="badge info">{{ ro.status }}</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -95,6 +128,7 @@ export default {
     const loading = ref(true)
     const error = ref(null)
     const orders = ref([])
+    const restockOrders = ref([])
 
     // Use shared filters
     const {
@@ -153,13 +187,29 @@ export default {
       })
     }
 
-    onMounted(loadOrders)
+    // Submitted restock orders are independent of the shared filters
+    const loadRestockOrders = async () => {
+      try {
+        restockOrders.value = await api.getRestockOrders()
+      } catch (err) {
+        console.error('Failed to load restock orders:', err)
+      }
+    }
+
+    const restockUnits = (order) => order.items.reduce((sum, i) => sum + i.quantity, 0)
+
+    onMounted(() => {
+      loadOrders()
+      loadRestockOrders()
+    })
 
     return {
       t,
       loading,
       error,
       orders,
+      restockOrders,
+      restockUnits,
       getOrdersByStatus,
       getOrderStatusClass,
       formatDate,
@@ -275,5 +325,14 @@ export default {
 .item-meta {
   font-size: 0.813rem;
   color: #64748b;
+}
+.submitted-orders {
+  margin-top: 1.5rem;
+}
+
+.empty-state {
+  padding: 1.5rem;
+  color: #64748b;
+  text-align: center;
 }
 </style>
